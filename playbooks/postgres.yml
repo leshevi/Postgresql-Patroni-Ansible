@@ -1,0 +1,178 @@
+- name: Create hosts file
+  hosts: postgres
+  become: true
+  tasks:
+    - name: Add alle hosts and ip to /etc/hosts
+      ansible.builtin.lineinfile:
+        dest: /etc/hosts
+        regexp: '{{ hostvars[item].ansible_default_ipv4.address }}.*{{ item }}$'
+        line: "{{ hostvars[item].ansible_default_ipv4.address  }} {{ hostvars[item]['inventory_hostname'] }}"
+        state: present
+      become: true
+      with_items: "{{ groups.etcd }}"
+- name: Configure 3-node etcd cluster
+  hosts: postgres
+  become: true
+  vars:
+    etcd_version: "3.5.4"
+    etcd_data_dir: "/var/lib/etcd"
+    etcd_cluster_name: "etcd-cluster"
+    etcd_client_port: 2379
+    etcd_peer_port: 2380
+    etcd_cert_dir: "/etc/etcd/ssl"
+    etcd_user: "etcd"
+    etcd_group: "etcd"
+
+  tasks:
+    - name: Install dependencies
+      ansible.builtin.apt:
+        name:
+          - wget
+          - tar
+        state: present
+        update_cache: true
+
+    - name: Create etcd user
+      ansible.builtin.user:
+        name: "{{ etcd_user }}"
+        system: true
+        shell: /usr/sbin/nologin
+        home: "{{ etcd_data_dir }}"
+        create_home: false
+
+    - name: Create directories
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: directory
+        owner: "{{ etcd_user }}"
+        group: "{{ etcd_group }}"
+        mode: '0755'
+      loop:
+        - "{{ etcd_data_dir }}"
+        - "{{ etcd_cert_dir }}"
+        - /etc/etcd
+
+    - name: Download etcd
+      ansible.builtin.get_url:
+        url: "https://github.com/etcd-io/etcd/releases/download/v{{ etcd_version }}/etcd-v{{ etcd_version }}-linux-amd64.tar.gz"
+        dest: "/tmp/etcd-v{{ etcd_version }}-linux-amd64.tar.gz"
+        mode: '0755'
+
+    - name: Extract etcd
+      ansible.builtin.unarchive:
+        src: "/tmp/etcd-v{{ etcd_version }}-linux-amd64.tar.gz"
+        dest: /usr/local/bin
+        remote_src: true
+        extra_opts: "--strip-components=1"
+        owner: "{{ etcd_user }}"
+        group: "{{ etcd_group }}"
+        mode: '0755'
+
+    - name: Configure etcd service
+      ansible.builtin.template:
+        src: srv/etcd.service.j2
+        dest: /etc/systemd/system/etcd.service
+        owner: root
+        group: root
+        mode: '0644'
+
+    - name: Configure etcd environment
+      ansible.builtin.template:
+        src: srv/etcd.conf.j2
+        dest: /etc/etcd/etcd.conf
+        owner: "{{ etcd_user }}"
+        group: "{{ etcd_group }}"
+        mode: '0640'
+
+    - name: Reload systemd daemon
+      ansible.builtin.systemd:
+        daemon_reload: true
+
+    - name: Enable and start etcd service
+      ansible.builtin.systemd:
+        name: etcd
+        state: started
+        enabled: true
+
+  handlers:
+    - name: Restart etcd
+      ansible.builtin.systemd:
+        name: etcd
+        state: restarted
+
+- name: Set up Patroni PostgreSQL cluster
+  hosts: postgres
+  become: true
+  vars:
+    postgresql_replication_password: "your_replication_password"
+    postgresql_superuser_password: "your_superuser_password"
+  tasks:
+    - name: Update apt cache
+      ansible.builtin.apt:
+        update_cache: true
+
+    - name: Install common packages
+      ansible.builtin.apt:
+        name:
+          - python3-pip
+          - python3-psycopg2
+          - python3-requests
+        state: present
+
+    - name: Install PostgreSQL
+      ansible.builtin.apt:
+        name: postgresql
+        state: present
+
+    - name: Ensure PostgreSQL is stopped (Patroni will manage it)
+      ansible.builtin.service:
+        name: postgresql
+        state: stopped
+        enabled: false
+
+    - name: Recursively remove directory
+      ansible.builtin.file:
+        path: /var/lib/postgresql/15/main
+        state: absent
+
+    - name: Create a directory if it does not exist
+      ansible.builtin.file:
+        path: /var/lib/postgresql/15/main
+        state: directory
+        mode: '0750'
+        recurse: true
+        owner: postgres
+        group: postgres
+
+    - name: Install Patroni
+      ansible.builtin.apt:
+        pkg:
+          - patroni
+          - python3-etcd
+          - python3-kazoo
+        state: present
+        install_recommends: false
+
+    - name: Create Patroni configuration directory
+      ansible.builtin.file:
+        path: /etc/patroni
+        state: directory
+        owner: postgres
+        group: postgres
+        mode: '0755'
+
+    - name: Deploy Patroni configuration
+      ansible.builtin.template:
+        src: srv/patroni.yml.j2
+        dest: /etc/patroni/config.yml
+        owner: postgres
+        group: postgres
+        mode: '0755'
+
+    - name: Ensure Patroni service is enabled and started
+      ansible.builtin.systemd:
+        name: patroni
+        enabled: true
+        state: started
+
+
